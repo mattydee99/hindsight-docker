@@ -1,0 +1,41 @@
+services:
+  hindsight:
+    image: ghcr.io/vectorize-io/hindsight:0.8.4
+    container_name: hindsight
+    ports:
+      - "127.0.0.1:8889:8888"   # API  (loopback only — LAN access via Tailscale if needed)
+      - "127.0.0.1:9999:9999"   # UI   (loopback only)
+    volumes:
+      - hindsight-data:/home/hindsight/.pg0
+    environment:
+      # LLM for retain (fact extraction) and reflect (synthesis)
+      # oMLX local inference — single-threaded Metal; concurrency must be 1 to avoid queue timeouts
+      - HINDSIGHT_API_LLM_PROVIDER=openai
+      - HINDSIGHT_API_LLM_BASE_URL=http://host.docker.internal:8000/v1
+      - HINDSIGHT_API_LLM_API_KEY=${MLX_API_KEY}
+      - HINDSIGHT_API_LLM_MODEL=gemma-4-26b-a4b-it-4bit
+      # oMLX is single-threaded — concurrency=1 prevents queue-induced timeouts
+      - HINDSIGHT_API_LLM_MAX_CONCURRENT=1
+      - HINDSIGHT_API_LLM_TIMEOUT=900
+      - HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT=1
+      # Failover: Gemini 2.5 Flash (cloud) — only used when oMLX (primary) is unreachable.
+      # Same config previously used in docker-compose.cloud.yml; Cloud DPA = no training.
+      - HINDSIGHT_API_LLM_1_PROVIDER=openai
+      - HINDSIGHT_API_LLM_1_BASE_URL=https://generativelanguage.googleapis.com/v1beta/openai/
+      - HINDSIGHT_API_LLM_1_API_KEY=${GEMINI_API_KEY_HIND}
+      - HINDSIGHT_API_LLM_1_MODEL=gemini-2.5-flash
+      - 'HINDSIGHT_API_LLM_STRATEGY={"mode":"failover"}'
+      # Embedding: 'local' default runs BAAI/bge-small-en-v1.5 inside the container
+      # No embedding config needed unless switching providers
+      # Recency decay (server-level, applies to ALL banks — not per-bank configurable).
+      # Exponential half-life favors fresher signals; 14d chosen as a middle ground
+      # between fast-moving investment research and slower-moving personal/mental-health banks.
+      - HINDSIGHT_API_RECENCY_DECAY_FUNCTION=exponential
+      - HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS=14
+    shm_size: 512m
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  hindsight-data:
