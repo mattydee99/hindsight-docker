@@ -13,11 +13,44 @@ services:
       - HINDSIGHT_API_LLM_PROVIDER=openai
       - HINDSIGHT_API_LLM_BASE_URL=http://host.docker.internal:8000/v1
       - HINDSIGHT_API_LLM_API_KEY=${MLX_API_KEY}
-      - HINDSIGHT_API_LLM_MODEL=gemma-4-26b-a4b-it-4bit
+      - HINDSIGHT_API_LLM_MODEL=Qwen3.6-35B-A3B-oQ4-mtp
       # oMLX is single-threaded — concurrency=1 prevents queue-induced timeouts
       - HINDSIGHT_API_LLM_MAX_CONCURRENT=1
       - HINDSIGHT_API_LLM_TIMEOUT=900
       - HINDSIGHT_API_REFLECT_LLM_MAX_CONCURRENT=1
+      # Reflect cost control for the research bank (grew past ~8k facts). The >600s
+      # timeouts that silently failed 2/3 refreshes were a RUNAWAY case: the agentic
+      # loop occasionally grinding through up to 10 iterations of ever-growing context.
+      # A/B tested 2026-07-11 (same domain-connections query, Qwen3.6-35B-A3B-oQ4-mtp):
+      #   - The real fix is MAX_ITERATIONS 10->6 (kills the runaway).
+      #   - A converged reflect naturally pulls only ~50k tokens / 2 iterations, so the
+      #     80k context ceiling never binds on normal runs => NO quality loss (70 named
+      #     entities @80k vs 66 @100k vs only 30 @48k — 48k was too aggressive and
+      #     measurably thinned the output). 80k caps the absolute worst case only.
+      #   - WALL_TIMEOUT 300->600 is a backstop; converged reflects land ~120s.
+      # Model swap ruled out: Qwen (3B active + MTP self-speculation) already beats
+      # gemma-4-26B-A4B + external draft on this workload. (2026-07-11)
+      - HINDSIGHT_API_REFLECT_MAX_CONTEXT_TOKENS=80000
+      - HINDSIGHT_API_REFLECT_MAX_ITERATIONS=6
+      - HINDSIGHT_API_REFLECT_WALL_TIMEOUT=600
+      # ROOT-CAUSE fix for the "2/3 models fail then retry" symptom.
+      # refresh_after_consolidation enqueues all of a bank's mental-model refreshes at
+      # once. They're worker tasks with 0 reserved slots, so they draw from the SHARED
+      # slot pool (= WORKER_MAX_SLOTS - sum(reservations) = 10 - 2 = 8 by default) and
+      # all run concurrently. Each starts its own 600s reflect wall-clock, but on
+      # single-threaded oMLX (REFLECT_LLM_MAX_CONCURRENT=1) the LLM calls serialize —
+      # so models at the back of the queue burn their whole budget WAITING, not
+      # computing, and time out. Proof (2026-07-11 end-session QA): open-questions
+      # timed out at 600s under 3-way contention, then completed in 202s running alone.
+      # There is no per-type MAX slot knob; the only lever is the shared-pool size.
+      # Setting WORKER_MAX_SLOTS=3 leaves consolidation's 2 reserved slots intact and
+      # shrinks the shared pool to 1 -> refresh (and retain) tasks run one-at-a-time,
+      # each getting oMLX to itself for its full wall-clock. No throughput loss: oMLX is
+      # single-threaded so these LLM-bound tasks serialize at the model anyway; this just
+      # aligns the scheduler with the hardware. (NB: HINDSIGHT_API_MENTAL_MODEL_REFRESH_
+      # CONCURRENCY only gates the cron/maintenance refresh loop, which we don't use —
+      # it does NOT gate the consolidation-triggered worker path, verified in source.)
+      - HINDSIGHT_API_WORKER_MAX_SLOTS=3
       # Failover: Gemini 2.5 Flash (cloud) — only used when oMLX (primary) is unreachable.
       # Same config previously used in docker-compose.cloud.yml; Cloud DPA = no training.
       - HINDSIGHT_API_LLM_1_PROVIDER=openai
@@ -32,7 +65,10 @@ services:
       # between fast-moving investment research and slower-moving personal/mental-health banks.
       - HINDSIGHT_API_RECENCY_DECAY_FUNCTION=exponential
       - HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS=14
-    shm_size: 512m
+    # Postgres parallel index builds (per-bank pgvector indexes at bank creation)
+    # request ~509MB dynamic shared memory — 512m failed with DiskFullError when
+    # /dev/shm wasn't completely empty (2026-07-10). tmpfs: only uses RAM when allocated.
+    shm_size: 2g
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
