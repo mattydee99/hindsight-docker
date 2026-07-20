@@ -65,6 +65,16 @@ services:
       # between fast-moving investment research and slower-moving personal/mental-health banks.
       - HINDSIGHT_API_RECENCY_DECAY_FUNCTION=exponential
       - HINDSIGHT_API_RECENCY_DECAY_HALFLIFE_DAYS=14
+      # Stable worker identity across container restarts. Without this, worker ID
+      # defaults to the container's short hash, which changes every recreate — the
+      # old identity's in-progress task claims become orphaned zombies that a live
+      # worker can see as claimable but can never actually acquire (DB-level claim
+      # fails against the dead identity). Found 2026-07-20: 5 refresh_mental_model
+      # tasks (orchestrator x2, mental_health_dev x3) had been stuck this way for
+      # 21-22 days, undetected until an unrelated graph_maintenance task also got
+      # stuck behind them. Fixed reactively via `hindsight-admin decommission-workers`;
+      # this pins identity so it stops recurring on every restart.
+      - HINDSIGHT_API_WORKER_ID=hindsight-worker-1
     # Postgres parallel index builds (per-bank pgvector indexes at bank creation)
     # request ~509MB dynamic shared memory — 512m failed with DiskFullError when
     # /dev/shm wasn't completely empty (2026-07-10). tmpfs: only uses RAM when allocated.
